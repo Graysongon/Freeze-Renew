@@ -2,8 +2,9 @@
 const { test, expect, chromium } = require('@playwright/test');
 const https = require('https');
 
-const tokensInput = process.env.DISCORD_TOKEN || '';
-const tokens = tokensInput.split(',').map(t => t.trim()).filter(Boolean);
+// 环境变量改为读取账号列表，格式: 邮箱:密码 或 备注#邮箱:密码，多个账号用逗号分隔
+const accountsInput = process.env.DISCORD_ACCOUNTS || process.env.DISCORD_TOKEN || '';
+const accounts = accountsInput.split(',').map(t => t.trim()).filter(Boolean);
 const [TG_CHAT_ID, TG_TOKEN] = (process.env.TG_BOT || ',').split(',');
 
 const TIMEOUT = 60000;
@@ -62,7 +63,6 @@ function sendTG(result) {
         req.end();
     });
 }
-
 
 async function handleOAuthPage(page) {
     console.log(`  📄 当前 URL: ${page.url()}`);
@@ -124,8 +124,8 @@ async function handleOAuthPage(page) {
 }
 
 test('FreezeHost 自动续期', async ({}, testInfo) => {
-    if (tokens.length === 0) {
-        throw new Error('❌ 缺少 DISCORD_TOKEN 环境变量，请配置');
+    if (accounts.length === 0) {
+        throw new Error('❌ 缺少 DISCORD_ACCOUNTS 环境变量，请配置');
     }
 
     let proxyConfig = undefined;
@@ -148,14 +148,13 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
         }
     }
 
-    console.log(`🔧 启动浏览器 (共需处理 ${tokens.length} 个账号)...`);
+    console.log(`🔧 启动浏览器 (共需处理 ${accounts.length} 个账号)...`);
     const browser = await chromium.launch({
-        headless: true,
+        headless: true, // 如果遇到验证码，可以尝试在本地改为 false 进行调试
         proxy: proxyConfig,
     });
 
     try {
-        // ── 出口 IP 验证（仅测一次） ─────────────────────────
         console.log('🌐 验证出口 IP...');
         try {
             const ipPage = await browser.newPage();
@@ -172,30 +171,36 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
         let allSummary = [];
         let globalHasError = false;
 
-        // ── 遍历处理每个 Token 账号 ─────────────────────────
-        for (let tIndex = 0; tIndex < tokens.length; tIndex++) {
-            let currentToken = tokens[tIndex];
+        for (let tIndex = 0; tIndex < accounts.length; tIndex++) {
+            let currentAccount = accounts[tIndex];
             let customName = null;
+            let email = '';
+            let password = '';
 
-            // 支持 '自定义备注#Token' 或 '自定义备注:Token' 的格式
-            const match = currentToken.match(/^([^#:]+)[#:](.+)$/);
-            if (match) {
-                customName = match[1].trim();
-                currentToken = match[2].trim();
+            // 支持 '备注#邮箱:密码' 或 '邮箱:密码' 的格式
+            const matchWithCustomName = currentAccount.match(/^([^#]+)#(.+):(.+)$/);
+            const matchSimple = currentAccount.match(/^(.+):(.+)$/);
+
+            if (matchWithCustomName) {
+                customName = matchWithCustomName[1].trim();
+                email = matchWithCustomName[2].trim();
+                password = matchWithCustomName[3].trim();
+            } else if (matchSimple) {
+                email = matchSimple[1].trim();
+                password = matchSimple[2].trim();
+            } else {
+                console.log(`❌ 账号格式错误，跳过: ${currentAccount}`);
+                continue;
             }
 
-            let accountLabel = customName ? `👤 ${customName}` : `👤 账号 ${tIndex + 1}`;
+            let accountLabel = customName ? `👤 ${customName}` : `👤 ${email}`;
             
             console.log('\n' + '='.repeat(50));
             console.log(`🚀 开始处理 ${accountLabel}`);
             console.log('='.repeat(50));
 
-            // 每个账号使用独立的上下文，隔离 Cookie 和 LocalStorage
             const context = await browser.newContext();
 
-            // ── 全局 Cookie 弹窗自动拦截（MutationObserver 注入）────────
-            // 在浏览器内部监控 DOM，一旦 fc-consent-root 弹窗出现立刻点掉
-            // 覆盖所有页面（登录前/后、跳转控制台等），无需在各环节手动处理
             await context.addInitScript(() => {
                 const tryDismiss = () => {
                     const root = document.querySelector('.fc-consent-root');
@@ -208,7 +213,6 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
                 };
                 const observer = new MutationObserver(tryDismiss);
                 observer.observe(document.body, { childList: true, subtree: true });
-                // 页面加载时也执行一次，防止弹窗已存在
                 tryDismiss();
             });
 
@@ -216,46 +220,34 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
             page.setDefaultTimeout(TIMEOUT);
             
             try {
-                // ── 预登录 Discord ────────────────────────────────────
-                console.log('🔑 使用 Token 预登录 Discord...');
+                // ── 预登录 Discord (账号密码方式) ────────────────────────────────────
+                console.log(`🔑 使用账号密码登录 Discord: ${email}...`);
                 await page.goto('https://discord.com/login', { waitUntil: 'domcontentloaded' });
                 
-                await page.evaluate((token) => {
-                    const iframe = document.createElement('iframe');
-                    document.body.appendChild(iframe);
-                    iframe.contentWindow.localStorage.setItem('token', `"${token}"`);
-                }, currentToken);
+                // 等待账号密码输入框出现
+                await page.waitForSelector('input[name="email"]', { timeout: 15000 });
                 
-                console.log('🔄 刷新页面验证 Token...');
-                await page.waitForTimeout(1000);
-                await page.reload({ waitUntil: 'domcontentloaded' });
-                await page.waitForTimeout(3000);
-                
-                if (page.url().includes('login')) {
-                    throw new Error('Discord Token 失效或被踢出，登录失败');
-                }
-                console.log('✅ Discord Token 验证有效...');
+                // 模拟人类输入
+                await page.type('input[name="email"]', email, { delay: 50 });
+                await page.type('input[name="password"]', password, { delay: 50 });
+                await page.click('button[type="submit"]');
 
-                // ── 尝试自动读取 Discord 账号名 ─────────────────────
+                console.log('🔄 提交表单，等待登录跳转...');
+                
+                // 等待成功登录的特征 (跳转到 /app 或 /channels)
                 try {
-                    const autoName = await page.evaluate(async (tok) => {
-                        try {
-                            const res = await fetch('https://discord.com/api/v9/users/@me', {
-                                headers: { 'Authorization': tok }
-                            });
-                            if (!res.ok) return null;
-                            const data = await res.json();
-                            return data.global_name || data.username || data.email || null;
-                        } catch(err) { return null; }
-                    }, currentToken);
-                    
-                    if (autoName) {
-                        console.log(`🤖 成功抓取 Discord 档案: ${autoName}`);
-                        if (!customName) {
-                            accountLabel = `👤 ${autoName}`;
-                        }
+                    await page.waitForURL(/discord\.com\/(channels|app)/, { timeout: 15000 });
+                    console.log('✅ Discord 登录成功...');
+                } catch (e) {
+                    // 如果超时没有跳转，检查是否有错误提示（密码错误或遇到验证码）
+                    const errorMsg = await page.locator('[class*="errorMessage"]').textContent().catch(() => null);
+                    if (errorMsg) {
+                        throw new Error(`登录被拒绝: ${errorMsg}`);
                     }
-                } catch (e) { }
+                    // 截图保存异常现场，方便排查是否触发了 Captcha
+                    await page.screenshot({ path: `test-results/login-failed-${email.replace(/@/g, '_')}.png`, fullPage: true });
+                    throw new Error('Discord 登录失败，可能遇到了 hCaptcha 或新设备邮件验证（已截图）');
+                }
 
                 // ── 登录 FreezeHost ───────────────────────────────────
                 console.log('🔑 打开 FreezeHost 登录页...');
@@ -298,7 +290,7 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
                         url => url.includes('/callback') || url.includes('/dashboard'),
                         { timeout: 10000 }
                     );
-                } catch { /* 可能已经在 dashboard */ }
+                } catch { }
 
                 if (page.url().includes('/callback')) {
                     await page.waitForURL(/free\.freezehost\.pro\/dashboard/);
@@ -315,7 +307,6 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
                 let coins = '未知';
                 try {
                     const coinText = await page.evaluate(() => {
-                        // 1. 尝试精确定位 "AVAILABLE BALANCE"
                         const allEls = Array.from(document.querySelectorAll('*'));
                         const balEl = allEls.find(e => e.children.length === 0 && e.textContent.includes('AVAILABLE BALANCE'));
                         if (balEl) {
@@ -325,10 +316,8 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
                                 p = p.parentElement;
                             }
                         }
-                        // 2. 尝试找 .fa-coins
                         const coinIcon = document.querySelector('.fa-coins');
                         if (coinIcon && coinIcon.parentElement) return coinIcon.parentElement.innerText.trim();
-                        // 3. Fallback: 找含有 Coins 的短文本
                         const elements = Array.from(document.querySelectorAll('span, div, p, h1, h2, h3, h4, h5, h6, b, strong'));
                         for (const el of elements) {
                             if (el.innerText && el.innerText.includes('Coins') && el.innerText.length < 20) return el.innerText.trim();
@@ -338,7 +327,6 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
                     
                     const matches = coinText.match(/[\d,]+(\.\d+)?/g);
                     if (matches) {
-                        // 取出最长的一串数字（如 2,078）
                         coins = matches.reduce((longest, current) => current.length > longest.length ? current : longest, matches[0]);
                     }
                     console.log(`💰 当前金币: ${coins}`);
@@ -372,7 +360,6 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
                     await page.goto(sUrl, { waitUntil: 'domcontentloaded' });
                     await page.waitForTimeout(3000);
                     
-                    // 1. 尝试抓取具体的服务器名字
                     const serverName = await page.evaluate(() => {
                         const h = document.querySelector('h1, h2, h3, .server-name, .font-bold.text-xl');
                         if (h && h.innerText && h.innerText.length < 30) return h.innerText.trim();
@@ -382,7 +369,6 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
                     });
                     console.log(`  📛 服务器名称: ${serverName}`);
 
-                    // 2. 抓取续期状态文本
                     const renewalStatusText = await page.evaluate(() => {
                         const el = document.getElementById('renewal-status-console');
                         return el ? el.innerText.trim() : null;
@@ -406,10 +392,8 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
                             const valH = hMatch ? parseFloat(hMatch[1]) : 0;
                             const valM = mMatch ? parseFloat(mMatch[1]) : 0;
 
-                            // 统一折算为总天数
                             remainingDaysVal = valD + (valH / 24) + (valM / 1440);
 
-                            // 再重新干净地分解为天、时、分
                             d = Math.floor(remainingDaysVal);
                             const tH = (remainingDaysVal - d) * 24;
                             h = Math.floor(tH);
@@ -430,7 +414,6 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
                         }
                     }
 
-                    // 准备推送排版
                     let statusText = '';
                     let finalTimeDisplay = timeDisplay;
 
@@ -446,15 +429,11 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
                         continue;
                     }
 
-                    // ── 点击外链图标打开续期弹窗 ─────────────────────────
                     console.log('  🔍 查找续期入口...');
                     try {
-                        // 只匹配可见的外链图标，跳过隐藏的 reviewAction 等按钮
-                        // Cookie 弹窗已由 addInitScript 全局自动处理
                         const externalLinkIcon = page.locator('i.fa-external-link-alt:visible').first();
                         const parentEl = externalLinkIcon.locator('xpath=..');
                         await parentEl.waitFor({ state: 'visible', timeout: 8000 });
-                        // force:true 忽略残留的遮罩层
                         await parentEl.hover({ force: true });
                         await page.waitForTimeout(500);
                         await externalLinkIcon.click({ force: true });
@@ -483,7 +462,7 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
                         if (finalUrl.includes('success=RENEWED')) {
                             console.log('  🎉 续期成功！');
                             statusText = `✅ 续期成功`;
-                            finalTimeDisplay = `14天 0小时 0分钟`; // 成功基本就是满血14天
+                            finalTimeDisplay = `14天 0小时 0分钟`; 
                         } else if (finalUrl.includes('err=CANNOTAFFORDRENEWAL')) {
                             console.log('  ⚠️ 余额不足，无法续期');
                             statusText = `⚠️ 余额不足`;
@@ -499,15 +478,14 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
                         statusText = `❌ 异常 (${err.message.slice(0, 15)})`;
                         globalHasError = true;
                         
-                        // 自动截取错误瞬间截图
                         try {
                             const safeName = serverName.replace(/[^\w\u4e00-\u9fa5-]+/g, '_');
                             await page.screenshot({ path: `test-results/${safeName}-error.png`, fullPage: true });
                             console.log(`  📸 已保存错误截图: test-results/${safeName}-error.png`);
-                        } catch (e) { /* 截图失败不报错 */ }
+                        } catch (e) { }
                     }
                     pushResult();
-                } // End Server Loop
+                } 
             } catch (err) {
                 console.log(`❌ 账号 ${tIndex + 1} 发生异常: ${err.message}`);
                 allSummary.push(`${accountLabel} ❌ 登录或处理失败 (${err.message.slice(0, 30)})`);
@@ -519,9 +497,8 @@ test('FreezeHost 自动续期', async ({}, testInfo) => {
             } finally {
                 await context.close();
             }
-        } // End Token Loop
+        } 
 
-        // ── 发送总体通知（仅在最后一次尝试时推送，避免重试重复通知） ──
         console.log('\n📄 最终执行报告:');
         const finalPushText = allSummary.join('\n');
         console.log(finalPushText);
